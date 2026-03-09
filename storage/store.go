@@ -81,7 +81,16 @@ func Open() (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	return openAt(path)
+}
 
+// OpenAt opens (or creates) the BoltDB store at the given path and initialises
+// all buckets.  It is intended for use in tests that need an isolated database.
+func OpenAt(path string) (*Store, error) {
+	return openAt(path)
+}
+
+func openAt(path string) (*Store, error) {
 	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 2 * time.Second})
 	if err != nil {
 		return nil, fmt.Errorf("open bolt db: %w", err)

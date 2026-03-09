@@ -97,8 +97,8 @@ type appModel struct {
 	// BoltDB store (may be nil if open failed)
 	store *storage.Store
 
-	// API key (kept for AutoAgent construction)
-	apiKey string
+	// providerCfg is kept for AutoAgent construction.
+	providerCfg agents.ProviderConfig
 
 	// ── Session / sidebar ─────────────────────────────────────────────────
 	sessions      []storage.SessionMeta // all named sessions
@@ -108,20 +108,20 @@ type appModel struct {
 	sidebarScroll int                   // scroll offset for the session list
 }
 
-func initialModel(ag *agents.ShellAgent, cwd, apiKey string, st *storage.Store) appModel {
+func initialModel(ag *agents.ShellAgent, cwd string, providerCfg agents.ProviderConfig, st *storage.Store) appModel {
 	m := appModel{
-		agent:      ag,
-		cwd:        cwd,
-		apiKey:     apiKey,
-		store:      st,
-		width:      80,
-		height:     24,
-		mode:       modeShell,
-		themeIdx:   0,
-		theme:      themes.All[0],
-		suggester:  tui.NewSuggester(),
-		histCursor: -1,
-		autoAgent:  agents.NewAutoAgent(apiKey, cwd),
+		agent:       ag,
+		cwd:         cwd,
+		providerCfg: providerCfg,
+		store:       st,
+		width:       80,
+		height:      24,
+		mode:        modeShell,
+		themeIdx:    0,
+		theme:       themes.All[0],
+		suggester:   tui.NewSuggester(),
+		histCursor:  -1,
+		autoAgent:   agents.NewAutoAgent(providerCfg, cwd),
 	}
 
 	// ── Restore scalar preferences ────────────────────────────────────────
@@ -1391,21 +1391,30 @@ func (m *appModel) clampSidebarScroll() {
 // ─── Entry point ──────────────────────────────────────────────────────────────
 
 func main() {
-	apiKey := os.Getenv("GOOGLE_API_KEY")
-	if apiKey == "" {
-		fmt.Fprintln(os.Stderr,
-			"Error: GOOGLE_API_KEY is not set.\n"+
-				"Get a key at https://aistudio.google.com/apikey and run:\n"+
-				"  export GOOGLE_API_KEY=<your-key>")
+	// Detect which provider to use based on available environment variables.
+	providerCfg, err := agents.DetectProvider()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error: "+err.Error())
+		fmt.Fprintln(os.Stderr, "\nSupported providers (set any one API key):")
+		fmt.Fprintln(os.Stderr, "  Google Gemini  — export GOOGLE_API_KEY=<key>")
+		fmt.Fprintln(os.Stderr, "  OpenAI         — export OPENAI_API_KEY=<key>")
+		fmt.Fprintln(os.Stderr, "  Anthropic      — export ANTHROPIC_API_KEY=<key>")
+		fmt.Fprintln(os.Stderr, "\nOptional overrides:")
+		fmt.Fprintln(os.Stderr, "  export PROVIDER=<google|openai|anthropic>")
+		fmt.Fprintln(os.Stderr, "  export MODEL=<model-name>")
 		os.Exit(1)
 	}
 
 	ctx := context.Background()
-	ag, err := agents.New(ctx, apiKey)
+	ag, err := agents.New(ctx, providerCfg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to initialise AI agent: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to initialise AI agent (%s): %v\n",
+			agents.ProviderDisplay(providerCfg.Kind), err)
 		os.Exit(1)
 	}
+
+	fmt.Fprintf(os.Stderr, "Using provider: %s (model: %s)\n",
+		agents.ProviderDisplay(providerCfg.Kind), providerCfg.DefaultModel())
 
 	// Open (or create) the BoltDB session store — non-fatal if it fails.
 	st, storeErr := storage.Open()
@@ -1417,7 +1426,7 @@ func main() {
 	}
 
 	cwd, _ := os.Getwd()
-	p := tea.NewProgram(initialModel(ag, cwd, apiKey, st))
+	p := tea.NewProgram(initialModel(ag, cwd, providerCfg, st))
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)
 		os.Exit(1)

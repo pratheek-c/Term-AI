@@ -1,5 +1,8 @@
-// Package agents provides an AI agent backed by Google Gemini (via the ADK)
-// that can answer questions and execute shell commands as tools.
+// Package agents provides AI agents backed by configurable LLM providers.
+//
+// Supported providers: Google Gemini, OpenAI, Anthropic Claude.
+// Provider selection is automatic based on available environment variables,
+// or can be forced with the PROVIDER env var.
 package agents
 
 import (
@@ -7,22 +10,29 @@ import (
 	"fmt"
 	"strings"
 
-	"google.golang.org/adk/agent"
-	"google.golang.org/adk/agent/llmagent"
-	"google.golang.org/adk/model/gemini"
-	"google.golang.org/adk/runner"
-	"google.golang.org/adk/session"
-	"google.golang.org/adk/tool"
-	"google.golang.org/genai"
-
 	"tui-start/tools"
 )
 
-const (
-	appName = "ai-shell"
-	userID  = "local-user"
+// shellToolSpec describes the execute_shell_command tool in terms of our
+// provider-agnostic ToolSpec type.
+var shellToolSpec = ToolSpec{
+	Name: "execute_shell_command",
+	Description: `Execute a bash shell command on the user's system and return stdout, stderr, and exit code.
+Use this to: run commands, inspect files, check system status, list directories, install packages, or perform any terminal operation.
+Examples: "ls -la", "cat /etc/os-release", "df -h", "ps aux | grep python", "uname -a"`,
+	Parameters: map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"command": map[string]any{
+				"type":        "string",
+				"description": "The bash command to execute on the system",
+			},
+		},
+		"required": []string{"command"},
+	},
+}
 
-	systemInstruction = `You are an expert Linux system administrator and shell assistant embedded in an AI-powered terminal (AI Shell).
+const systemInstruction = `You are an expert Linux system administrator and shell assistant embedded in an AI-powered terminal (AI Shell).
 
 Your role:
 - Suggest and explain shell commands concisely
@@ -36,91 +46,45 @@ Response style (this is a terminal UI, not a chat app):
 - Put commands in backtick blocks: ` + "`command`" + `
 - After executing a command, summarise the key result in one sentence
 - If a command fails, explain why and suggest a fix`
-)
 
-// ShellAgent wraps a Google ADK runner with a Gemini-backed agent
-// that has shell-execution capabilities.
+// ShellAgent wraps an LLMClient and provides shell-execution capabilities.
 type ShellAgent struct {
-	r         *runner.Runner
-	sessionID string
+	llm LLMClient
 }
 
-// New creates a ShellAgent using the provided Gemini API key.
-func New(ctx context.Context, apiKey string) (*ShellAgent, error) {
-	llm, err := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{
-		APIKey: apiKey,
-	})
+// New creates a ShellAgent using the given ProviderConfig.
+func New(ctx context.Context, cfg ProviderConfig) (*ShellAgent, error) {
+	llm, err := NewLLMClient(ctx, cfg, systemInstruction)
 	if err != nil {
-		return nil, fmt.Errorf("creating gemini model: %w", err)
+		return nil, fmt.Errorf("creating LLM client (%s): %w", cfg.Kind, err)
 	}
+	return &ShellAgent{llm: llm}, nil
+}
 
-	shellTool, err := tools.NewShellTool()
-	if err != nil {
-		return nil, fmt.Errorf("creating shell tool: %w", err)
-	}
-
-	a, err := llmagent.New(llmagent.Config{
-		Name:        "shell_assistant",
-		Model:       llm,
-		Description: "A Linux shell assistant that can suggest and execute commands.",
-		Instruction: systemInstruction,
-		Tools:       []tool.Tool{shellTool},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating llm agent: %w", err)
-	}
-
-	sessionSvc := session.InMemoryService()
-	createResp, err := sessionSvc.Create(ctx, &session.CreateRequest{
-		AppName: appName,
-		UserID:  userID,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating session: %w", err)
-	}
-
-	r, err := runner.New(runner.Config{
-		AppName:        appName,
-		Agent:          a,
-		SessionService: sessionSvc,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("creating runner: %w", err)
-	}
-
-	return &ShellAgent{
-		r:         r,
-		sessionID: createResp.Session.ID(),
-	}, nil
+// NewShellAgentWithLLM creates a ShellAgent with a pre-built LLMClient.
+// This is intended for testing, where a mock LLMClient can be injected.
+func NewShellAgentWithLLM(llm LLMClient) *ShellAgent {
+	return &ShellAgent{llm: llm}
 }
 
 // Ask sends a prompt to the AI agent and returns the final text response.
-// It blocks until the agent completes (including any tool calls).
+// The agent may execute shell commands as part of answering.
 func (sa *ShellAgent) Ask(ctx context.Context, prompt string) (string, error) {
-	content := genai.NewContentFromText(prompt, genai.RoleUser)
-
-	var parts []string
-	for event, err := range sa.r.Run(ctx, userID, sa.sessionID, content, agent.RunConfig{
-		StreamingMode: agent.StreamingModeNone,
-	}) {
-		if err != nil {
-			return "", fmt.Errorf("agent run error: %w", err)
+	executor := func(call ToolCall) (string, error) {
+		cmd, _ := call.Args["command"].(string)
+		stdout, stderr, exitCode := tools.ExecCommand("", cmd)
+		parts := []string{}
+		if strings.TrimSpace(stdout) != "" {
+			parts = append(parts, strings.TrimRight(stdout, "\n"))
 		}
-		if event == nil || !event.IsFinalResponse() {
-			continue
+		if strings.TrimSpace(stderr) != "" {
+			parts = append(parts, "stderr: "+strings.TrimRight(stderr, "\n"))
 		}
-		if event.Content == nil {
-			continue
+		if exitCode != 0 {
+			parts = append(parts, fmt.Sprintf("exit: %d", exitCode))
 		}
-		for _, p := range event.Content.Parts {
-			if p.Text != "" {
-				parts = append(parts, p.Text)
-			}
-		}
+		return strings.Join(parts, "\n"), nil
 	}
 
-	if len(parts) == 0 {
-		return "(no response)", nil
-	}
-	return strings.Join(parts, ""), nil
+	return sa.llm.ChatWithTools(ctx, prompt, []ToolSpec{shellToolSpec}, executor, nil, nil)
 }
