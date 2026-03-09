@@ -109,7 +109,12 @@ var staticCommands = []string{
 
 // ─── Suggestion engine ────────────────────────────────────────────────────────
 
-const maxSuggestions = 8
+// MaxSuggestions is the maximum number of autocomplete candidates returned
+// by Suggester.Match.
+const MaxSuggestions = 8
+
+// maxSuggestions is the package-level alias for internal use.
+const maxSuggestions = MaxSuggestions
 
 // Suggester maintains an input-history ring and provides prefix-based matches.
 type Suggester struct {
